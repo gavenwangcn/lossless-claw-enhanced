@@ -1761,13 +1761,13 @@ export class LcmContextEngine implements ContextEngine {
             if (contentMatches) {
               // Same conversation under new file path (gateway restart).
               // Update stored path and fall through to normal bootstrap.
-              console.error(
+              console.warn(
                 `[lcm] bootstrap: session file path changed but content matches checkpoint — ` +
                   `updating stored path (likely gateway restart)`,
               );
               bootstrapState.sessionFilePath = params.sessionFile;
             } else {
-            console.error(
+            console.warn(
               `[lcm] bootstrap: session file rotated for session ${params.sessionId}: ` +
                 `"${bootstrapState.sessionFilePath}" → "${params.sessionFile}" — resetting conversation ${conversationId}`,
             );
@@ -1806,7 +1806,7 @@ export class LcmContextEngine implements ContextEngine {
             const msgCount = this.db
               .prepare(`DELETE FROM messages WHERE conversation_id = ?`)
               .run(conversationId).changes;
-            console.error(
+            console.warn(
               `[lcm] bootstrap: purged ${msgCount} messages and all summaries for conversation ${conversationId}`,
             );
             // Reset local state so the code below treats this as a fresh conversation.
