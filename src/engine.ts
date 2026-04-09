@@ -2032,6 +2032,70 @@ export class LcmContextEngine implements ContextEngine {
     return result;
   }
 
+  /**
+   * Remove messages from the batch that already exist in the DB for this session.
+   * Conservative replay detection: only strip a prefix when the incoming
+   * batch begins with the entire stored transcript for the session.
+   *
+   * Fixes two issues from #246:
+   * 1. Replaced hasMessage() fast-path with aligned-tail check — the old
+   *    approach false-positives on legitimate repeated first messages
+   * 2. Dedup now runs on newMessages only, before autoCompactionSummary
+   *    is prepended — synthetic summaries can no longer interfere with
+   *    replay detection
+   */
+  private async deduplicateAfterTurnBatch(
+    sessionId: string,
+    batch: AgentMessage[],
+  ): Promise<AgentMessage[]> {
+    if (batch.length === 0) return batch;
+
+    const conversation = await this.conversationStore.getConversationBySessionId(sessionId);
+    if (!conversation) return batch;
+
+    const conversationId = conversation.conversationId;
+    const storedMessageCount = await this.conversationStore.getMessageCount(conversationId);
+    if (storedMessageCount === 0 || storedMessageCount > batch.length) {
+      return batch;
+    }
+
+    // Aligned-tail check: DB's last message must match the message at the
+    // exact replay boundary in the incoming batch. This replaces the
+    // hasMessage() check which could false-positive on any repeated content.
+    const lastDbMessage = await this.conversationStore.getLastMessage(conversationId);
+    if (!lastDbMessage) return batch;
+
+    const storedBatch = batch.map((m) => toStoredMessage(m));
+    const batchAtBoundary = storedBatch[storedMessageCount - 1]!;
+    if (
+      messageIdentity(lastDbMessage.role, lastDbMessage.content) !==
+      messageIdentity(batchAtBoundary.role, batchAtBoundary.content)
+    ) {
+      return batch;
+    }
+
+    // Full proof: incoming batch must start with the entire stored transcript
+    // in exact order before we trim anything.
+    const storedMessages = await this.conversationStore.getMessages(conversationId, {
+      limit: storedMessageCount,
+    });
+    if (storedMessages.length !== storedMessageCount) {
+      return batch;
+    }
+    for (let i = 0; i < storedMessageCount; i += 1) {
+      const storedConversationMessage = storedMessages[i]!;
+      const incomingMessage = storedBatch[i]!;
+      if (
+        messageIdentity(storedConversationMessage.role, storedConversationMessage.content) !==
+        messageIdentity(incomingMessage.role, incomingMessage.content)
+      ) {
+        return batch;
+      }
+    }
+
+    return batch.slice(storedMessageCount);
+  }
+
   private async ingestSingle(params: {
     sessionId: string;
     sessionKey?: string;
@@ -2206,6 +2270,12 @@ export class LcmContextEngine implements ContextEngine {
     }
     this.ensureMigrated();
 
+    // Dedup guard: prevent duplicate ingestion when gateway restart replays
+    // full history. Run on newMessages BEFORE prepending autoCompactionSummary
+    // so synthetic summaries cannot interfere with replay detection.
+    const newMessages = params.messages.slice(params.prePromptMessageCount);
+    const dedupedNewMessages = await this.deduplicateAfterTurnBatch(params.sessionId, newMessages);
+
     const ingestBatch: AgentMessage[] = [];
     if (params.autoCompactionSummary) {
       ingestBatch.push({
@@ -2214,8 +2284,7 @@ export class LcmContextEngine implements ContextEngine {
       } as AgentMessage);
     }
 
-    const newMessages = params.messages.slice(params.prePromptMessageCount);
-    ingestBatch.push(...newMessages);
+    ingestBatch.push(...dedupedNewMessages);
     if (ingestBatch.length === 0) {
       return;
     }

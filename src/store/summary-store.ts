@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
+import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
 
 export type SummaryKind = "leaf" | "condensed";
 export type ContextItemType = "message" | "summary";
@@ -193,6 +194,10 @@ interface ConversationBootstrapStateRow {
   updated_at: string;
 }
 
+const CJK_QUERY_SEGMENT_RE =
+  /[\u2E80-\u9FFF\u3400-\u4DBF\uF900-\uFAFF\uAC00-\uD7AF\u3040-\u309F\u30A0-\u30FF]+/g;
+const LATIN_QUERY_TOKEN_RE = /[a-zA-Z0-9][\w./-]*/g;
+
 // ── Row mappers ───────────────────────────────────────────────────────────────
 
 function toSummaryRecord(row: SummaryRow): SummaryRecord {
@@ -210,8 +215,8 @@ function toSummaryRecord(row: SummaryRow): SummaryRecord {
     content: row.content,
     tokenCount: row.token_count,
     fileIds,
-    earliestAt: row.earliest_at ? new Date(row.earliest_at) : null,
-    latestAt: row.latest_at ? new Date(row.latest_at) : null,
+    earliestAt: parseUtcTimestampOrNull(row.earliest_at),
+    latestAt: parseUtcTimestampOrNull(row.latest_at),
     descendantCount:
       typeof row.descendant_count === "number" &&
       Number.isFinite(row.descendant_count) &&
@@ -231,7 +236,7 @@ function toSummaryRecord(row: SummaryRow): SummaryRecord {
         ? Math.floor(row.source_message_token_count)
         : 0,
     model: typeof row.model === "string" ? row.model : "unknown",
-    createdAt: new Date(row.created_at),
+    createdAt: parseUtcTimestamp(row.created_at),
   };
 }
 
@@ -242,7 +247,7 @@ function toContextItemRecord(row: ContextItemRow): ContextItemRecord {
     itemType: row.item_type,
     messageId: row.message_id,
     summaryId: row.summary_id,
-    createdAt: new Date(row.created_at),
+    createdAt: parseUtcTimestamp(row.created_at),
   };
 }
 
@@ -252,7 +257,7 @@ function toSearchResult(row: SummarySearchRow): SummarySearchResult {
     conversationId: row.conversation_id,
     kind: row.kind,
     snippet: row.snippet,
-    createdAt: new Date(row.created_at),
+    createdAt: parseUtcTimestamp(row.created_at),
     rank: row.rank,
   };
 }
@@ -266,7 +271,7 @@ function toLargeFileRecord(row: LargeFileRow): LargeFileRecord {
     byteSize: row.byte_size,
     storageUri: row.storage_uri,
     explorationSummary: row.exploration_summary,
-    createdAt: new Date(row.created_at),
+    createdAt: parseUtcTimestamp(row.created_at),
   };
 }
 
@@ -280,7 +285,7 @@ function toConversationBootstrapStateRecord(
     lastSeenMtimeMs: row.last_seen_mtime_ms,
     lastProcessedOffset: row.last_processed_offset,
     lastProcessedEntryHash: row.last_processed_entry_hash,
-    updatedAt: new Date(row.updated_at),
+    updatedAt: parseUtcTimestamp(row.updated_at),
   };
 }
 
@@ -384,6 +389,17 @@ export class SummaryStore {
     } catch {
       // FTS indexing failed — search won't find this summary but
       // compaction and assembly will still work correctly.
+    }
+
+    // Also index into the CJK trigram FTS table for CJK substring search.
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO summaries_fts_cjk(summary_id, content) VALUES (?, ?)`,
+        )
+        .run(input.summaryId, input.content);
+    } catch {
+      // CJK trigram FTS table may not exist yet (pre-migration); ignore.
     }
 
     return toSummaryRecord(row);
@@ -750,10 +766,30 @@ export class SummaryStore {
     const limit = input.limit ?? 50;
 
     if (input.mode === "full_text") {
-      // FTS5 unicode61 can return incomplete matches for CJK text, so route
-      // those queries through the existing LIKE fallback path immediately.
+      // FTS5 unicode61 cannot segment CJK ideographs, so CJK queries route
+      // through the trigram FTS table first, then fall back to LIKE with OR
+      // semantics (instead of the original AND logic which fails when the
+      // user's phrasing doesn't exactly match the summary text).
       if (containsCjk(input.query)) {
-        return this.searchLike(
+        const cjkSegments = this.extractCjkSegments(input.query);
+        const hasShortCjkSegment = cjkSegments.some((segment) => segment.length < 3);
+        if (!hasShortCjkSegment) {
+          try {
+            const trigramResults = this.searchCjkTrigram(
+              input.query,
+              limit,
+              input.conversationId,
+              input.since,
+              input.before,
+            );
+            if (trigramResults.length > 0) {
+              return trigramResults;
+            }
+          } catch {
+            // trigram table may not exist; fall through to LIKE OR
+          }
+        }
+        return this.searchLikeCjk(
           input.query,
           limit,
           input.conversationId,
@@ -870,6 +906,183 @@ export class SummaryStore {
       conversationId: row.conversation_id,
       kind: row.kind,
       snippet: createFallbackSnippet(row.content, plan.terms),
+      createdAt: parseUtcTimestamp(row.created_at),
+      rank: 0,
+    }));
+  }
+
+  private extractCjkSegments(query: string): string[] {
+    return query.match(CJK_QUERY_SEGMENT_RE) ?? [];
+  }
+
+  private extractLatinTokens(query: string): string[] {
+    const tokens = query.match(LATIN_QUERY_TOKEN_RE) ?? [];
+    return [...new Set(tokens.map((token) => token.toLowerCase()))];
+  }
+
+  private escapeLikeTerm(term: string): string {
+    return term.replace(/([\\%_])/g, "\\$1");
+  }
+
+  // ── CJK trigram FTS search ──────────────────────────────────────────────
+  // Each CJK segment of 3+ chars is split into overlapping 4-char chunks for
+  // trigram MATCH with OR semantics within the segment. Segment groups are
+  // combined with AND, and Latin tokens are applied as LIKE filters so mixed
+  // queries still require every part of the user's intent.
+
+  /**
+   * Split a CJK string into overlapping chunks of `size` characters.
+   * E.g. "端到端测试结果" with size=4 →
+   *   ["端到端测", "到端测试", "端测试结", "测试结果"]
+   */
+  private splitCjkChunks(text: string, size: number): string[] {
+    const chunks: string[] = [];
+    for (let i = 0; i <= text.length - size; i++) {
+      const chunk = text.slice(i, i + size);
+      if (!chunks.includes(chunk)) {
+        chunks.push(chunk);
+      }
+    }
+    return chunks;
+  }
+
+  private searchCjkTrigram(
+    query: string,
+    limit: number,
+    conversationId?: number,
+    since?: Date,
+    before?: Date,
+  ): SummarySearchResult[] {
+    const cjkSegments = this.extractCjkSegments(query).filter((segment) => segment.length >= 3);
+    if (cjkSegments.length === 0) {
+      return [];
+    }
+    const latinTokens = this.extractLatinTokens(query);
+
+    // Build one OR group per CJK segment, then require every segment group and
+    // every Latin token to match so mixed queries preserve full-intent search.
+    const cjkGroups: string[] = [];
+    for (const segment of cjkSegments) {
+      const segmentTerms =
+        segment.length <= 4 ? [segment] : this.splitCjkChunks(segment, 4);
+      const groupExpr = [...new Set(segmentTerms)]
+        .map((term) => `"${term.replace(/"/g, '""')}"`)
+        .join(" OR ");
+      cjkGroups.push(`(${groupExpr})`);
+    }
+
+    const where: string[] = ["summaries_fts_cjk MATCH ?"];
+    const args: Array<string | number> = [cjkGroups.join(" AND ")];
+    for (const token of latinTokens) {
+      where.push("LOWER(s.content) LIKE ? ESCAPE '\\'");
+      args.push(`%${this.escapeLikeTerm(token)}%`);
+    }
+    if (conversationId != null) {
+      where.push("s.conversation_id = ?");
+      args.push(conversationId);
+    }
+    if (since) {
+      where.push("julianday(s.created_at) >= julianday(?)");
+      args.push(since.toISOString());
+    }
+    if (before) {
+      where.push("julianday(s.created_at) < julianday(?)");
+      args.push(before.toISOString());
+    }
+    args.push(limit);
+
+    const sql = `SELECT
+         f.summary_id,
+         s.conversation_id,
+         s.kind,
+         snippet(summaries_fts_cjk, 1, '', '', '...', 32) AS snippet,
+         rank,
+         s.created_at
+       FROM summaries_fts_cjk f
+       JOIN summaries s ON s.summary_id = f.summary_id
+       WHERE ${where.join(" AND ")}
+       ORDER BY rank
+       LIMIT ?`;
+    const rows = this.db.prepare(sql).all(...args) as unknown as SummarySearchRow[];
+    return rows.map(toSearchResult);
+  }
+
+  // ── CJK LIKE fallback ────────────────────────────────────────────────────
+  // When the trigram table is unavailable, split each CJK segment into
+  // sliding-window terms so partial matches still work. Terms within a single
+  // segment are ORed together, but each segment and Latin token still has to
+  // match so mixed queries keep full-intent semantics.
+
+  private searchLikeCjk(
+    query: string,
+    limit: number,
+    conversationId?: number,
+    since?: Date,
+    before?: Date,
+  ): SummarySearchResult[] {
+    const cjkSegments = this.extractCjkSegments(query);
+    const latinTokens = this.extractLatinTokens(query);
+    if (cjkSegments.length === 0 && latinTokens.length === 0) {
+      return [];
+    }
+
+    const cjkTerms: string[] = [];
+    const cjkClauses: string[] = [];
+    const cjkArgs: string[] = [];
+    for (const segment of cjkSegments) {
+      const segmentTerms =
+        segment.length === 1
+          ? [segment]
+          : segment.length === 2
+            ? [segment]
+            : this.splitCjkChunks(segment, 2);
+      const uniqueTerms = [...new Set(segmentTerms)];
+      cjkTerms.push(...uniqueTerms);
+      cjkClauses.push(
+        `(${uniqueTerms.map(() => `LOWER(content) LIKE ? ESCAPE '\\'`).join(" OR ")})`,
+      );
+      cjkArgs.push(
+        ...uniqueTerms.map((term) => `%${this.escapeLikeTerm(term.toLowerCase())}%`),
+      );
+    }
+
+    const latinClauses = latinTokens.map(() => `LOWER(content) LIKE ? ESCAPE '\\'`);
+    const latinArgs = latinTokens.map((token) => `%${this.escapeLikeTerm(token)}%`);
+
+    const where: string[] = [...cjkClauses, ...latinClauses];
+    const args: Array<string | number> = [...cjkArgs, ...latinArgs];
+    if (conversationId != null) {
+      where.push("conversation_id = ?");
+      args.push(conversationId);
+    }
+    if (since) {
+      where.push("julianday(created_at) >= julianday(?)");
+      args.push(since.toISOString());
+    }
+    if (before) {
+      where.push("julianday(created_at) < julianday(?)");
+      args.push(before.toISOString());
+    }
+    args.push(limit);
+
+    const rows = this.db
+      .prepare(
+        `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
+                earliest_at, latest_at, descendant_count, descendant_token_count,
+                source_message_token_count, model, created_at
+         FROM summaries
+         WHERE ${where.join(" AND ")}
+         ORDER BY created_at DESC
+         LIMIT ?`,
+      )
+      .all(...args) as unknown as SummaryRow[];
+
+    const snippetTerms = cjkTerms.length > 0 ? [...new Set([...cjkTerms, ...latinTokens])] : latinTokens;
+    return rows.map((row) => ({
+      summaryId: row.summary_id,
+      conversationId: row.conversation_id,
+      kind: row.kind,
+      snippet: createFallbackSnippet(row.content, snippetTerms),
       createdAt: new Date(row.created_at),
       rank: 0,
     }));
@@ -934,7 +1147,7 @@ export class SummaryStore {
           conversationId: row.conversation_id,
           kind: row.kind,
           snippet: match[0],
-          createdAt: new Date(row.created_at),
+          createdAt: parseUtcTimestamp(row.created_at),
           rank: 0,
         });
       }

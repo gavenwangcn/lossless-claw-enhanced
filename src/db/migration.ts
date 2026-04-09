@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { estimateTokens } from "../estimate-tokens.js";
 import { getLcmDbFeatures } from "./features.js";
+import { parseUtcTimestampOrNull } from "../store/parse-utc-timestamp.js";
 
 type SummaryColumnInfo = {
   name?: string;
@@ -63,18 +64,7 @@ function ensureSummaryMetadataColumns(db: DatabaseSync): void {
 }
 
 function parseTimestamp(value: string | null | undefined): Date | null {
-  if (typeof value !== "string" || !value.trim()) {
-    return null;
-  }
-
-  const direct = new Date(value);
-  if (!Number.isNaN(direct.getTime())) {
-    return direct;
-  }
-
-  const normalized = value.includes("T") ? value : `${value.replace(" ", "T")}Z`;
-  const parsed = new Date(normalized);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
+  return parseUtcTimestampOrNull(value);
 }
 
 function isoStringOrNull(value: Date | null): string | null {
@@ -739,6 +729,31 @@ export function runLcmMigrations(
         tokenize='porter unicode61'
       );
       INSERT INTO summaries_fts(summary_id, content)
+      SELECT summary_id, content FROM summaries;
+    `);
+  }
+
+  // ── CJK trigram FTS table ────────────────────────────────────────────────
+  // FTS5 unicode61 (porter) tokenizer cannot segment CJK ideographs, so CJK
+  // queries currently fall back to a LIKE path with AND logic.  When the user's
+  // phrasing doesn't match the summary verbatim (e.g. "端到端测试结果" vs
+  // "端到端测试"), ALL terms must match and the query returns 0 candidates.
+  //
+  // A trigram-tokenized table indexes every 3-character substring, enabling
+  // native CJK substring matching via FTS5 MATCH with OR semantics.
+  const cjkTableExists = db
+    .prepare(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='summaries_fts_cjk'",
+    )
+    .get();
+  if (!cjkTableExists) {
+    db.exec(`
+      CREATE VIRTUAL TABLE summaries_fts_cjk USING fts5(
+        summary_id UNINDEXED,
+        content,
+        tokenize='trigram'
+      );
+      INSERT INTO summaries_fts_cjk(summary_id, content)
       SELECT summary_id, content FROM summaries;
     `);
   }
